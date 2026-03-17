@@ -65,8 +65,6 @@ class DistL2Loss(nn.Module):
             loss += torch.pow(p1 - p2, 2).sum()
 
         loss /= num_params
-        loss = torch.sqrt(loss)
-
         return loss
 
 
