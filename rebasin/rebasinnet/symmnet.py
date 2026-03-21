@@ -1,4 +1,5 @@
 import torch
+from itertools import chain
 from copy import deepcopy
 from .sinkhorn import Sinkhorn, matching
 from .graph.auto_graph import solve_graph
@@ -184,6 +185,8 @@ class RebasinNet(torch.nn.Module):
         n_iter=20,
         operator="implicit",
         permutation_type="mat_mul",
+        scale_invariant=False,
+        lambda_scale=1e-4,
     ):
         super().__init__()
         assert operator in [
@@ -243,6 +246,19 @@ class RebasinNet(torch.nn.Module):
         self.tau = tau
         self.n_iter = n_iter
         self.operator = operator
+        self.scale_invariant = scale_invariant
+        self.lambda_scale = lambda_scale
+        self.u = torch.nn.ParameterList(
+            [
+                torch.nn.Parameter(
+                    torch.zeros((ps[0],), dtype=self.param_precision),
+                    requires_grad=True,
+                )
+                if ps is not None
+                else None
+                for ps in P_sizes
+            ]
+        )
 
     def update_batchnorm(self, model):
         self.reparamnet.update_batchnorm(model)
@@ -251,10 +267,27 @@ class RebasinNet(torch.nn.Module):
         for p in self.p:
             ci = torch.randperm(p.shape[0])
             p.data = (torch.eye(p.shape[0])[ci, :]).to(p.data.device)
+        for u in self.u:
+            if u is not None:
+                u.data.zero_()
 
     def identity_init(self):
         for p in self.p:
             p.data = torch.eye(p.shape[0]).to(p.data.device)
+        for u in self.u:
+            if u is not None:
+                u.data.zero_()
+
+    def scale_regularizer(self):
+        if not self.scale_invariant:
+            return torch.tensor(0.0, dtype=self.param_precision, device=self.p[0].device)
+
+        reg = torch.tensor(0.0, dtype=self.param_precision, device=self.p[0].device)
+        for u in self.u:
+            if u is not None:
+                reg = reg + torch.pow(u, 2).sum()
+
+        return self.lambda_scale * reg
 
     def eval(self):
         self.reparamnet.eval()
@@ -278,15 +311,24 @@ class RebasinNet(torch.nn.Module):
                         self.tau,
                     )
 
+                if self.scale_invariant:
+                    dk = torch.diag(torch.exp(self.u[i]))
+                    sk = sk @ dk
+
                 gk.append(sk)
 
         else:
-            gk = [
-                matching(p.cpu().detach().numpy())
-                .to(self.param_precision)
-                .to(self.p[0].device)
-                for p in self.p
-            ]
+            gk = list()
+            for i, p in enumerate(self.p):
+                hk = (
+                    matching(p.cpu().detach().numpy())
+                    .to(self.param_precision)
+                    .to(self.p[0].device)
+                )
+                if self.scale_invariant:
+                    dk = torch.diag(torch.exp(self.u[i].detach()))
+                    hk = hk @ dk.to(hk.device)
+                gk.append(hk)
 
         m = self.reparamnet(gk)
         if x is not None and x.ndim == 1:
@@ -302,11 +344,19 @@ class RebasinNet(torch.nn.Module):
         return super().zero_grad(set_to_none)
 
     def parameters(self, recurse: bool = True):
+        if self.scale_invariant:
+            return chain(
+                self.p.parameters(recurse),
+                self.u.parameters(recurse),
+            )
         return self.p.parameters(recurse)
 
     def to(self, device):
         for p in self.p:
             if p is not None:
                 p.data = p.data.to(device)
+        for u in self.u:
+            if u is not None:
+                u.data = u.data.to(device)
 
         return self

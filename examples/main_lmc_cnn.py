@@ -1,6 +1,6 @@
 import torch
 from models.vgg import VGG
-from rebasin.loss import RndLoss
+from rebasin.loss import MidLoss, RndLoss
 from rebasin import RebasinNet
 from copy import deepcopy
 from datasets.classification import MNistDataset, SmallMNistDataset
@@ -13,6 +13,9 @@ from time import time
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 if device == torch.device("cpu"):
     print("Consider using GPU, if available, for a significant speed up.")
+use_scale_invariance = False
+lambda_scale = 1e-4
+loss_name = "random"
 
 # preparing dataset
 dataset = SmallMNistDataset(root="minist_data", download=True, train=True)
@@ -65,14 +68,24 @@ print("Model B: test loss {:1.3f}, test accuracy {:1.3f}".format(loss, acc))
 modelB.eval()
 
 # rebasin network for model A
-pi_modelA = RebasinNet(modelA, input_shape=(1, 1, 28, 28))
+pi_modelA = RebasinNet(
+    modelA,
+    input_shape=(1, 1, 28, 28),
+    scale_invariant=use_scale_invariance,
+    lambda_scale=lambda_scale,
+)
 pi_modelA.to(device)
 
-# rand point loss
-criterion = RndLoss(modelB, criterion=torch.nn.CrossEntropyLoss())
+# original repo loss choices
+if loss_name == "random":
+    criterion = RndLoss(modelB, criterion=torch.nn.CrossEntropyLoss())
+elif loss_name == "midpoint":
+    criterion = MidLoss(modelB, criterion=torch.nn.CrossEntropyLoss())
+else:
+    raise ValueError("loss_name must be either 'random' or 'midpoint'")
 
-# optimizer for rebasin network
-optimizer = torch.optim.AdamW(pi_modelA.p.parameters(), lr=0.1)
+# optimizer for alignment variables
+optimizer = torch.optim.AdamW(pi_modelA.parameters(), lr=0.1)
 
 print("\nTraining Re-Basing network")
 t1 = time()
@@ -84,6 +97,7 @@ for iteration in range(20):
     for x, y in dataset_train:
         rebased_model = pi_modelA()
         loss_training = criterion(rebased_model, x.to(device), y.to(device))
+        loss_training = loss_training + pi_modelA.scale_regularizer()
 
         optimizer.zero_grad()
         loss_training.backward()
@@ -101,6 +115,7 @@ for iteration in range(20):
     for x, y in dataset_train:
         rebased_model = pi_modelA()
         loss_validation = criterion(rebased_model, x.to(device), y.to(device))
+        loss_validation = loss_validation + pi_modelA.scale_regularizer()
 
         cumulative_val_loss += loss_validation.item() * x.shape[0]
         total_val += x.shape[0]
