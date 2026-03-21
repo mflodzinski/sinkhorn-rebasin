@@ -17,6 +17,15 @@ use_scale_invariance = False
 lambda_scale = 1e-4
 loss_name = "random"
 
+
+def format_scale_stats(scale_stats):
+    if not scale_stats:
+        return "scale_stats=<disabled>"
+    return (
+        "scale[min={scale_min:.4f}, mean={scale_mean:.4f}, max={scale_max:.4f}] "
+        "inv_scale[min={inv_scale_min:.4f}, mean={inv_scale_mean:.4f}, max={inv_scale_max:.4f}]"
+    ).format(**scale_stats)
+
 # preparing dataset
 dataset = SmallMNistDataset(root="minist_data", download=True, train=True)
 training, validation = torch.utils.data.random_split(
@@ -127,6 +136,8 @@ for iteration in range(20):
             iteration, cumulative_train_loss, cumulative_val_loss
         )
     )
+    if use_scale_invariance:
+        print(format_scale_stats(pi_modelA.scale_stats()))
     if cumulative_val_loss == 0:
         break
 

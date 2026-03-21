@@ -3,6 +3,13 @@ from itertools import chain
 from copy import deepcopy
 from .sinkhorn import Sinkhorn, matching
 from .graph.auto_graph import solve_graph
+from .scale_utils import (
+    apply_input_inv_scale_to_weight,
+    apply_output_scale_to_weight,
+    get_inv_scale_vector,
+    get_scale_vector,
+    transform_bias_with_scale,
+)
 
 
 class ReparamNet(torch.nn.Module):
@@ -24,7 +31,17 @@ class ReparamNet(torch.nn.Module):
         for p1 in self.model.parameters():
             p1.requires_grad = False
 
-    def training_rebasin(self, P):
+    def _unpack_transform(self, transforms, index):
+        transform = transforms[index]
+        if isinstance(transform, dict):
+            return (
+                transform["perm"],
+                transform.get("scale", None),
+                transform.get("inv_scale", None),
+            )
+        return transform, None, None
+
+    def training_rebasin(self, transforms):
         for (name, p1), p2 in zip(
             self.output.named_parameters(), self.model.parameters()
         ):
@@ -39,38 +56,62 @@ class ReparamNet(torch.nn.Module):
                 if self.map_prev_param_index[name] is not None
                 else None
             )
+            Pi, scale_i, _ = (
+                self._unpack_transform(transforms, i) if i is not None else (None, None, None)
+            )
+            Pj, _, inv_scale_j = (
+                self._unpack_transform(transforms, j) if j is not None else (None, None, None)
+            )
 
             if "bias" in name[-4:]:
                 if i is not None:
-                    p1.copy_(P[i] @ p2)
+                    transformed = p2
+                    if scale_i is not None:
+                        transformed = transform_bias_with_scale(transformed, scale_i)
+                    p1.copy_(Pi @ transformed)
                 else:
                     continue
 
             # batchnorm
             elif len(p1.shape) == 1:
                 if i is not None:
-                    p1.copy_((P[i] @ p2.view(p1.shape[0], -1)).view(p2.shape))
+                    transformed = p2
+                    if scale_i is not None:
+                        transformed = transform_bias_with_scale(transformed, scale_i)
+                    p1.copy_((Pi @ transformed.view(p1.shape[0], -1)).view(p2.shape))
 
             # mlp / cnn
             elif "weight" in name[-6:]:
+                transformed = p2
                 if i is not None and j is None:
-                    p1.copy_((P[i] @ p2.view(P[i].shape[0], -1)).view(p2.shape))
+                    if scale_i is not None:
+                        transformed = apply_output_scale_to_weight(transformed, scale_i)
+                    p1.copy_((Pi @ transformed.view(Pi.shape[0], -1)).view(p2.shape))
 
                 if i is not None and j is not None:
+                    if scale_i is not None:
+                        transformed = apply_output_scale_to_weight(transformed, scale_i)
+                    transformed = (Pi @ transformed.view(Pi.shape[0], -1)).view(p2.shape)
+                    if inv_scale_j is not None:
+                        transformed = apply_input_inv_scale_to_weight(
+                            transformed, inv_scale_j
+                        )
                     p1.copy_(
                         (
-                            P[j].view(1, *P[j].shape)
-                            @ (P[i] @ p2.view(P[i].shape[0], -1)).view(
-                                p2.shape[0], P[j].shape[0], -1
-                            )
+                            Pj.view(1, *Pj.shape)
+                            @ transformed.view(p2.shape[0], Pj.shape[0], -1)
                         ).view(p2.shape)
                     )
 
                 if i is None and j is not None:
+                    if inv_scale_j is not None:
+                        transformed = apply_input_inv_scale_to_weight(
+                            transformed, inv_scale_j
+                        )
                     p1.copy_(
                         (
-                            P[j].view(1, *P[j].shape)
-                            @ p2.view(p2.shape[0], P[j].shape[0], -1)
+                            Pj.view(1, *Pj.shape)
+                            @ transformed.view(p2.shape[0], Pj.shape[0], -1)
                         ).view(p2.shape)
                     )
 
@@ -87,22 +128,27 @@ class ReparamNet(torch.nn.Module):
                 else:
                     m1.running_var.copy_(m2.running_var)
 
-    def permute_batchnorm(self, P):
+    def permute_batchnorm(self, transforms):
         for (name, m1), m2 in zip(self.output.named_modules(), self.model.modules()):
             if "BatchNorm" in str(type(m2)):
                 if name + ".weight" in self.map_param_index:
                     if m2.running_mean is None and m2.running_var is None:
                         continue
                     i = self.perm_dict[self.map_param_index[name + ".weight"]]
+                    Pi, _, _ = (
+                        self._unpack_transform(transforms, i)
+                        if i is not None
+                        else (None, None, None)
+                    )
                     index = (
-                        torch.argmax(P[i], dim=1)
+                        torch.argmax(Pi, dim=1)
                         if i is not None
                         else torch.arange(m2.running_mean.shape[0])
                     )
                     m1.running_mean.copy_(m2.running_mean[index, ...])
                     m1.running_var.copy_(m2.running_var[index, ...])
 
-    def eval_rebasin(self, P):
+    def eval_rebasin(self, transforms):
         for (name, p1), p2 in zip(
             self.output.named_parameters(), self.model.parameters()
         ):
@@ -117,41 +163,66 @@ class ReparamNet(torch.nn.Module):
                 if self.map_prev_param_index[name] is not None
                 else None
             )
+            Pi, scale_i, _ = (
+                self._unpack_transform(transforms, i) if i is not None else (None, None, None)
+            )
+            Pj, _, inv_scale_j = (
+                self._unpack_transform(transforms, j) if j is not None else (None, None, None)
+            )
 
             if "bias" in name[-4:]:
                 if i is not None:
-                    index = torch.argmax(P[i], dim=1)
-                    p1.copy_(p2.data[index, ...])
+                    transformed = p2.data
+                    if scale_i is not None:
+                        transformed = transform_bias_with_scale(transformed, scale_i)
+                    index = torch.argmax(Pi, dim=1)
+                    p1.copy_(transformed[index, ...])
                 else:
                     continue
 
             # batchnorm
             elif len(p1.shape) == 1:
                 if i is not None:
-                    index = torch.argmax(P[i], dim=1)
-                    p1.copy_(p2.data[index, ...])
+                    transformed = p2.data
+                    if scale_i is not None:
+                        transformed = transform_bias_with_scale(transformed, scale_i)
+                    index = torch.argmax(Pi, dim=1)
+                    p1.copy_(transformed[index, ...])
 
             # mlp / cnn
             elif "weight" in name[-6:]:
+                transformed = p2.data
                 if i is not None and j is None:
-                    index = torch.argmax(P[i], dim=1)
-                    p1.copy_(p2.data.view(P[i].shape[0], -1)[index, ...].view(p2.shape))
+                    if scale_i is not None:
+                        transformed = apply_output_scale_to_weight(transformed, scale_i)
+                    index = torch.argmax(Pi, dim=1)
+                    p1.copy_(transformed.view(Pi.shape[0], -1)[index, ...].view(p2.shape))
 
                 if i is not None and j is not None:
-                    index = torch.argmax(P[i], dim=1)
-                    p1.copy_(p2.data[index, ...])
-                    index = torch.argmax(P[j], dim=1)
-                    p1.copy_(p1.data[:, index, ...])
+                    if scale_i is not None:
+                        transformed = apply_output_scale_to_weight(transformed, scale_i)
+                    index = torch.argmax(Pi, dim=1)
+                    transformed = transformed[index, ...]
+                    if inv_scale_j is not None:
+                        transformed = apply_input_inv_scale_to_weight(
+                            transformed, inv_scale_j
+                        )
+                    index = torch.argmax(Pj, dim=1)
+                    p1.copy_(transformed[:, index, ...])
 
                 if i is None and j is not None:
-                    index = torch.argmax(P[j], dim=1)
+                    if inv_scale_j is not None:
+                        transformed = apply_input_inv_scale_to_weight(
+                            transformed, inv_scale_j
+                        )
+                    index = torch.argmax(Pj, dim=1)
                     p1.copy_(
                         (
-                            p2.data.view(p2.shape[0], P[j].shape[0], -1)[:, index, ...]
+                            transformed.view(p2.shape[0], Pj.shape[0], -1)[:, index, ...]
                         ).view(p2.shape)
                     )
 
-    def forward(self, P):
+    def forward(self, transforms):
         for p1, p2 in zip(self.output.parameters(), self.model.parameters()):
             p1.data = p2.data.clone()
 
@@ -159,11 +230,11 @@ class ReparamNet(torch.nn.Module):
             p1._grad_fn = None
 
         if self.training or self.permutation_type == "mat_mul":
-            self.training_rebasin(P)
+            self.training_rebasin(transforms)
         else:
-            self.eval_rebasin(P)
+            self.eval_rebasin(transforms)
 
-        self.permute_batchnorm(P)
+        self.permute_batchnorm(transforms)
 
         return self.output
 
@@ -289,6 +360,25 @@ class RebasinNet(torch.nn.Module):
 
         return self.lambda_scale * reg
 
+    def scale_stats(self):
+        if not self.scale_invariant:
+            return None
+
+        scales = torch.cat(
+            [get_scale_vector(u.detach()).flatten() for u in self.u if u is not None]
+        )
+        inv_scales = torch.cat(
+            [get_inv_scale_vector(u.detach()).flatten() for u in self.u if u is not None]
+        )
+        return {
+            "scale_min": float(scales.min().item()),
+            "scale_max": float(scales.max().item()),
+            "scale_mean": float(scales.mean().item()),
+            "inv_scale_min": float(inv_scales.min().item()),
+            "inv_scale_max": float(inv_scales.max().item()),
+            "inv_scale_mean": float(inv_scales.mean().item()),
+        }
+
     def eval(self):
         self.reparamnet.eval()
         return super().eval()
@@ -310,12 +400,16 @@ class RebasinNet(torch.nn.Module):
                         self.n_iter,
                         self.tau,
                     )
-
                 if self.scale_invariant:
-                    dk = torch.diag(torch.exp(self.u[i]))
-                    sk = sk @ dk
-
-                gk.append(sk)
+                    gk.append(
+                        {
+                            "perm": sk,
+                            "scale": get_scale_vector(self.u[i]),
+                            "inv_scale": get_inv_scale_vector(self.u[i]),
+                        }
+                    )
+                else:
+                    gk.append(sk)
 
         else:
             gk = list()
@@ -326,9 +420,15 @@ class RebasinNet(torch.nn.Module):
                     .to(self.p[0].device)
                 )
                 if self.scale_invariant:
-                    dk = torch.diag(torch.exp(self.u[i].detach()))
-                    hk = hk @ dk.to(hk.device)
-                gk.append(hk)
+                    gk.append(
+                        {
+                            "perm": hk,
+                            "scale": get_scale_vector(self.u[i].detach()),
+                            "inv_scale": get_inv_scale_vector(self.u[i].detach()),
+                        }
+                    )
+                else:
+                    gk.append(hk)
 
         m = self.reparamnet(gk)
         if x is not None and x.ndim == 1:
